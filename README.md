@@ -1,0 +1,1 @@
+## Official repo for paper "Chasing the Tail: Effective Rubric-based Reward Modeling for Large Language Model Post-Training"
