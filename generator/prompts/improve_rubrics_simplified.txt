@@ -1,0 +1,67 @@
+You're a skilled judge assessing the quality of LLM responses to a user prompt. The current rubric isn't good enough to effectively differentiate between high-quality responses.
+Your goal is to improve the current rurbics to address this (adding new creteria, rewriting, decomposing, and deleting the current creteria). The updated rubric must be comprehensive and consistently applicable for grading LLM responses. These criteria should specifically assess how well the LLM answered the given prompt. Only write rubrics you are confident about.
+
+
+Here are tips for writing good rubrics: 
+
+i. MECE: 
+    - Mutually Exclusive, Collectively Exhaustive
+ii. Completeness: 
+    - Consider all the elements you would want to include to create a perfect response and put them into the rubric. This means including not only the facts and statements directly requested by the prompt, but also the supporting details that provide justification, reasoning, and logic for your response. Each of these elements should have a criterion because each criterion helps to develop the answer to the question from a slightly different angle.
+iii.. No overlapping: 
+    - the same error from a model shouldn’t be punished multiple times. 
+iv. Diversity: 
+    - The rubric items should include variable types of information. 
+    - If all criteria are like “the response mentions A”, “the response mentions B”, then this is not a good rubric.
+v: How many rubric items for each prompt
+    - There is no golden standard, and the desired number of rubrics varies by accounts and task types.
+    - Write rubrics that cover all aspects of an ideal response.
+vi: How many rubric items to fail
+    - A good rule of thumb is that the model fails on 50% of rubrics items
+vii: Atomicity / Non-stacked
+    - Each rubric criterion should evaluate exactly one distinct aspect. Avoid bundling multiple criteria into a single rubric. Most stacked criteria with the word “and” can be broken up into multiple pieces. 
+    ❎ Response identifies George Washington as the first U.S. president and mentions he served two terms.
+    ✅ Response identifies George Washington as the first U.S. president.
+    ✅ Response mentions that George Washington served two terms.
+viii: Specificity
+    - Criteria should be binary (true or false) and objective.
+    - Avoid vague descriptions (e.g., "the response must be accurate" is vague).
+    - Example: "The response should list exactly three examples."
+ix: Self-contained
+    - Each criterion should contain all the information needed to evaluate a response, e.g.
+    ❎ Mentions the capital city of Canada.
+    ✅ Mentions the capital city of Canada is Ottawa.
+x: Criterion should be verifiable without requiring external search.
+    ❎ Response names any of the Nobel Prize winners in Physics in 2023
+    ✅ Response names any of the following Nobel Prize winners in Physics in 2023: Pierre Agostini, Ferenc Krausz, or Anne L’Huillier.
+xi: The binary criteria should be phrased so that yes means the model response is good and no means the model response is bad.
+
+Finally, we want to assign different weight for each criterion. Give a weight on a scale of 1 (least important) to 3 (most important) for each question based on 
+1. the question's alignment with user demand (3 if user would be frustrated if the answer is no; 1 if user would not be bothered at all if the answer is no)
+2. the question's importance in terms of determining quality/correctness (3 if the response would be completely incorrect if the answer is no; 1 if an extreme edge case would be missed and the overall quality won't be affected if the answer is no)
+
+Here is the user prompt for which we want to improve the rubric: 
+
+PROMPT:
+{prompt}
+
+The existing rubrics we are using is:
+
+{rubrics}
+
+The two reference responses are:
+
+Reponse 1:
+{response1}
+
+Reponse 2:
+{response2}
+
+
+Return ONLY the JSON array of the full rubrics, no other text. For example:
+[
+  {{"criterion": "Does the response provide specific release years for each song?", "weight": 2}},
+  {{"criterion": "The response includes artist names for each song mentioned", "weight": 1}}
+]
+
+Note: Local IDs will be automatically assigned to each criterion, so don't include IDs in your output.

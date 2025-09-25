@@ -1,0 +1,32 @@
+[
+  {
+    "prompt": "write the first chapter of a story: the DNC was a complete mess and probably meddled with, the republican incumbent seems unbeatable and a frustratingly a weak candidate got the nomination, a 4 foot 10 freaky little guy. The republican candidate was corrupt and passing regressive policies as well as using misinformation as an extremely effective tool. The Democratic establishment pretty much gave up on the freaky little guy and was waiting for the next elections, pretty much providing him no support. The day of the election arrives and...the freaky little guy wins in a 400 electoral vote landslide!? turns out the average person likes the guy for reasons nobody can really understand. The democratic establishment has to pivot to fully supporting the freaky little guy as he now wields great power within the party."
+  },
+  {
+    "prompt": "Let $B_t$ be a standard Brownian motion with $B_0=0$, and $X_t=B_t+ct$. Let stopping time $T=\\min_t X_t \\notin (a,b)$ where $a<0$ and $b>0$.\n\nFind the distribution of $X_T$, $\\mathbb{E}(T)$ and $\\mathbb{E}(T^2)$.\n\nHint: $c=0$ and $c \\ne 0$ should be solved separately."
+  },
+  {
+    "prompt": "Could reverse faulting transform into normal faulting?"
+  },
+  {
+    "prompt": "Why will AI models fail to achieve AGI? BE scientific, detailed and analyse the training patterns"
+  },
+  {
+    "prompt": "Compress the following to one line\nValve Procurement, installation and commissioning\nValve Testing, Repair & Maintenance\nInstrumentation & Calibration\nFabrication & Machining\nValve Hydro Testing\nHigh Pressure Pump Service\nValve Actuator Services\nOnline Greasing & Leak Sealing"
+  },
+  {
+    "prompt": "explain synthatic covered call"
+  },
+  {
+    "prompt": "Potřeboval bych doplnit členy do anglického textu. Jedná se o seznam změn v softwaru šířený v souboru CHANGELOG:\n* Limited settings editing for administrators only\n* System log is filtered to app related messages\n* Added digital outputs to datapoints\n* Removed V2 specific datapoints\n* Added control of digital outputs\n* Changed default value of unsolicited messages queue length\n* Changed binary inputs to variation with flages\n* Serial number for counters is now cut to 9 digits to avoid overflowing to total diferent number\n* Added system uptime to counters\n* Added support for \"Any variation\" and \"All points\" in read function\n* \"Port X\" names has been replaced with real serial port names\n"
+  },
+  {
+    "prompt": "write out the phone specs for the following phones: Moto Edge (2021)\n\nMoto Edge (2022)\n\nMoto Edge (2023)\n\nSamsung S22\n\nSamsung S21 Ultra\n\nSamsung S21\n\nSamsung S21 FE\n\nOneplus 8T\n\nOneplus 9\n\nOneplus 9 pro"
+  },
+  {
+    "prompt": "what are some foods that are high in insoluble fiber but have low or no soluble fiber?"
+  },
+  {
+    "prompt": " I need a sample letter asking for redress under the 2 year product guarantee (EU consumer rights) for a pair of jeans that is significantly larger than described in the sizing table of the seller. The jeans have 78 cm waist versus 63,5 cm waist (body size) described by the seller."
+  }
+]
