@@ -494,7 +494,7 @@ Return only the corrected JSON, no explanations or markdown formatting."""
 
 # --------------------------- API helpers ---------------------------
 
-BASE_URL: str = "https://litellm.ml-serving-internal.scale.com/v1"
+BASE_URL: str = "Your litellm base url"
 _openai_client: Optional[OpenAI] = None
 _openai_client_lock = threading.Lock()
 
@@ -585,7 +585,7 @@ def generate_via_api(
             "model": model,
             "messages": messages,
             "temperature": temperature,
-            "user": "scale_random_user"
+            "user": "random_user"
         }
         # Apply max tokens with provider-specific conventions
         if max_tokens is not None:
