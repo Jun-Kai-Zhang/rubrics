@@ -2,8 +2,6 @@ import os
 import re
 import random
 import json
-import torch
-import math
 import time
 import pandas as pd
 import numpy as np
@@ -28,20 +26,7 @@ except ImportError:
     SamplingParams = None
 
 # Load environment once at import time to avoid repeated file opens in threaded code
-# Try to load from project root first, then current directory
-from pathlib import Path
-
-# Get the project root directory (assuming generator is a subdirectory)
-project_root = Path(__file__).parent.parent
-env_file = project_root / ".env"
-
-if env_file.exists():
-    load_dotenv(env_file)
-    print(f"Loaded environment variables from {env_file}")
-else:
-    # Try current directory as fallback
-    load_dotenv(".env")
-    print("Warning: No .env file found in project root, trying current directory")
+load_dotenv(".env")
 
 # Print the litellm API key being used
 # api_key = os.environ.get("LOSS_ANALYSIS_KEY")
@@ -494,7 +479,7 @@ Return only the corrected JSON, no explanations or markdown formatting."""
 
 # --------------------------- API helpers ---------------------------
 
-BASE_URL: str = "Your litellm base url"
+BASE_URL: str = "http://localhost:4000" # Change to your own
 _openai_client: Optional[OpenAI] = None
 _openai_client_lock = threading.Lock()
 
@@ -585,7 +570,7 @@ def generate_via_api(
             "model": model,
             "messages": messages,
             "temperature": temperature,
-            "user": "random_user"
+            "user": "scale_random_user"
         }
         # Apply max tokens with provider-specific conventions
         if max_tokens is not None:

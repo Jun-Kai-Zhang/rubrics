@@ -1,24 +1,27 @@
 files:
   initial_rubrics: null
   responses_file: null
-  output_dir: "workflow_outputs"
+  output_dir: null  # optional run name under workflow_outs; null -> timestamped run
 
 workflow:
-  # Style is now always "improve" (full replacement)
   initial_responses_per_prompt: 2
   max_iterations: 1
   sample_size: null
+  exclude_used_reference_responses: true # if true, drop the two responses used for improvement from subsequent iterations
+  selection_strategy: top2
 
 models:
-  # Backend is always API now
+  verifier_backend: "api"
   verifier: "openai/gpt-4.1-mini"
+  proposer_backend: "api"
   rubric_generator: "openai/gpt-4.1"
 
+vllm:
+  tensor_parallel_size: null
+  max_model_len: 16384
+  enforce_eager: false
 
 api:
   workers: 64
   max_retries: 1
   retry_temperature: 1.0
-
-grading:
-  skip_scoring: true # if true: skip scoring step, assign all responses score 0 (making them tied), randomly select 2 for rubric improvement, continue until max_iterations

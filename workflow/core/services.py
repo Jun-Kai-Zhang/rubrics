@@ -1,7 +1,7 @@
 """Core business services."""
 
 import logging
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 from collections import defaultdict
 
 from workflow.data_structures import TieAnalysis
@@ -17,10 +17,10 @@ class RubricService:
         current_rubrics: Dict[str, Dict],
         improved_rubrics: Dict[str, Dict]
     ) -> Dict[str, Dict]:
-        """Merge improved rubrics with current ones."""
-        merged = current_rubrics.copy()
-        merged.update(improved_rubrics)
-        return merged
+        """Replace current rubrics with the improved set, unless empty."""
+        if not improved_rubrics:
+            return current_rubrics.copy()
+        return improved_rubrics.copy()
     
     def filter_rubrics_for_prompts(
         self,
@@ -32,58 +32,6 @@ class RubricService:
             prompt_id: rubrics[prompt_id]
             for prompt_id in prompt_ids
             if prompt_id in rubrics
-        }
-
-
-class ScoringService:
-    """Service for scoring-related operations."""
-    
-    def extract_top_responses(
-        self,
-        scored_data: Dict,
-        responses_per_prompt: Dict[str, int]
-    ) -> List[Dict]:
-        """Extract top-scoring responses based on per-prompt limits."""
-        extracted_responses = []
-        
-        for result in scored_data.get("results", []):
-            prompt_id = result["id"]
-            scored_responses = result["scored_responses"]
-            
-            if not scored_responses:
-                continue
-            
-            # Sort by score descending
-            sorted_responses = sorted(
-                scored_responses,
-                key=lambda x: x["score"],
-                reverse=True
-            )
-            
-            # Take specified number of responses
-            num_to_take = responses_per_prompt.get(prompt_id, 1)
-            top_responses = sorted_responses[:num_to_take]
-            
-            extracted_responses.append({
-                "id": prompt_id,
-                "prompt": result.get("prompt"),
-                "responses": [r["response"] for r in top_responses]
-            })
-        
-        return extracted_responses
-    
-    def calculate_next_iteration_responses(
-        self,
-        ties_per_prompt: Dict[str, int],
-        current_responses: int,
-        min_responses: int
-    ) -> Dict[str, int]:
-        """Calculate responses needed for next iteration."""
-        quarter_current = max(1, current_responses // 4)
-        
-        return {
-            prompt_id: max(min_responses, quarter_current, num_tied)
-            for prompt_id, num_tied in ties_per_prompt.items()
         }
 
 
@@ -164,20 +112,3 @@ class TieAnalysisService:
             highest_scores_by_prompt=highest_scores_by_prompt
         )
     
-    def should_continue_iteration(
-        self,
-        tie_analysis: TieAnalysis,
-        skip_scoring: bool = False
-    ) -> Tuple[bool, str]:
-        """Determine if workflow should continue to next iteration.
-        
-        Args:
-            tie_analysis: Analysis of ties in current iteration
-            skip_scoring: If True, continue on all prompts until max iterations
-        
-        Returns:
-            Tuple of (should_continue, reason)
-        """
-        # Always continue (force_continue is always True)
-        # (max iterations is handled by the loop in workflow_coordinator)
-        return True, "force_continue_mode" 

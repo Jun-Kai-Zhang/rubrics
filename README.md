@@ -8,12 +8,13 @@ First create .env in the project directory and save your litellm api key as LITE
 
 To get 16 responses per promts from gemini-2.5-pro:
 ```
-python data_preparation/rollouts.py --model-id gemini/gemini-2.5-pro --num-responses-per-prompt 16 --output-dir data --output-filename gemini_pro_rollouts.json --input-file data/sample_prompts.json
+python data_preparation/rollouts.py --models gemini/gemini-2.5-pro --num-responses-per-model 16 --output-dir data --output-filename gemini_pro_rollouts.json --input-file data/sample_prompts.json
 ```
 
 To get 1 response per prompt per model (16 models in total):
 ```
-python data_preparation/rollouts_sotas.py --num-responses-per-prompt 1 --output-dir data --output-filename sotas_rollouts.json --input-file data/sample_prompts.json
+python data_preparation/rollouts.py --num-responses-per-model 1 --output-dir data --output-filename sotas_rollouts.json --input-file data/sample_prompts.j
+son
 ```
 
 #### Create rubrics

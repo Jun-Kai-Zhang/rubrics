@@ -1,8 +1,7 @@
 """Data structures for the workflow system."""
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any, Union, Set
-import time
+from typing import Dict, List, Optional, Union, Set
 
 @dataclass
 class IterationInfo:
@@ -12,15 +11,10 @@ class IterationInfo:
     sample_size: Optional[int]
     start_time: str
     status: str = "in_progress"
-    scored_file: Optional[str] = None
     has_ties: bool = False
     prompt_ids_with_ties: List[str] = None
     prompt_ids_without_ties: List[str] = None
     ties_per_prompt: Dict[str, int] = None
-    improved_rubrics_file: Optional[str] = None
-    next_iteration_responses_file: Optional[str] = None
-    grading_mode: Optional[str] = None
-    next_responses_per_prompt: Union[int, Dict[str, int], str] = None
     
     def __post_init__(self):
         if self.prompt_ids_with_ties is None:
@@ -61,9 +55,4 @@ class WorkflowResult:
         if self.processed_prompt_ids is None:
             self.processed_prompt_ids = set()
 
-@dataclass
-class MountedWorkflowData:
-    """Data loaded from a mounted workflow."""
-    processed_prompt_ids: set
-    final_rubrics_file: Optional[str]
-    metadata: Dict[str, Any] 
+ 

@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-@hydra.main(version_base=None, config_path="./configs", config_name="default")
+@hydra.main(version_base=None, config_path="./configs", config_name="single")
 def main(cfg: DictConfig) -> None:
     """Main workflow execution with Hydra configuration.
     
@@ -33,7 +33,9 @@ def main(cfg: DictConfig) -> None:
     
     # Print workflow summary
     sample_desc = f"{cfg.workflow.sample_size} prompts" if cfg.workflow.sample_size else "all prompts"
-    log.info(f"Config: {sample_desc}, API backend, max {cfg.workflow.max_iterations} iterations")
+    proposer_backend = getattr(cfg.models, 'proposer_backend', 'api')
+    verifier_backend = getattr(cfg.models, 'verifier_backend', 'api')
+    log.info(f"Config: {sample_desc}, proposer={proposer_backend}, verifier={verifier_backend}, max {cfg.workflow.max_iterations} iterations")
     
     # Create and run workflow engine
     engine = WorkflowEngine(cfg)

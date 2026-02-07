@@ -13,6 +13,8 @@ from generator.utils import get_gpu_count, VLLM_AVAILABLE
 
 log = logging.getLogger(__name__)
 
+DEFAULT_OUTPUT_ROOT = "workflow_outputs"
+
 
 class WorkflowEngine:
     """Workflow engine that delegates to the modular orchestration system.
@@ -71,10 +73,21 @@ class WorkflowEngine:
             cfg_dict['files']['output_dir'] = output_dir
             self.cfg = OmegaConf.create(cfg_dict)
         else:
-            # Create timestamped output directory
+            # Create output directory scoped under the shared workflow_outs root
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            base_output_dir = self.cfg.files.output_dir
-            output_dir = os.path.join(base_output_dir, f"run_{timestamp}")
+            configured_subdir = getattr(self.cfg.files, 'output_dir', None)
+            configured_subdir = str(configured_subdir).strip() if configured_subdir else ""
+            if configured_subdir and configured_subdir.lower() != "null":
+                run_subdir = os.path.normpath(configured_subdir)
+                if run_subdir in ("", "."):
+                    run_subdir = f"run_{timestamp}"
+                elif os.path.isabs(run_subdir) or run_subdir.startswith(".."):
+                    raise ValueError("files.output_dir must be a relative path under workflow_outs")
+            else:
+                run_subdir = f"run_{timestamp}"
+
+            base_output_dir = os.path.abspath(DEFAULT_OUTPUT_ROOT)
+            output_dir = os.path.join(base_output_dir, run_subdir)
             
             # Update the config to use the timestamped directory
             cfg_dict = OmegaConf.to_container(self.cfg, resolve=True)
@@ -83,7 +96,7 @@ class WorkflowEngine:
             
             # Create the timestamped output directory
             os.makedirs(output_dir, exist_ok=True)
-            log.info(f"Created timestamped output directory: {output_dir}")
+            log.info(f"Created output directory under {DEFAULT_OUTPUT_ROOT}: {output_dir}")
             
             # Save a copy of the resolved config in the output directory
             try:
@@ -98,8 +111,17 @@ class WorkflowEngine:
         self.coordinator = WorkflowCoordinator(self.cfg)
     
     def _setup_vllm(self) -> None:
-        """Removed vLLM support - always use API."""
-        pass
+        """Setup vLLM configuration if using vLLM backend."""
+        # Check if either proposer or verifier is using vLLM
+        proposer_backend = getattr(self.cfg.models, 'proposer_backend', 'api')
+        verifier_backend = getattr(self.cfg.models, 'verifier_backend', 'api')
+
+        if (proposer_backend == "vllm" or verifier_backend == "vllm") and VLLM_AVAILABLE:
+            # Auto-detect GPUs if not specified
+            if self.cfg.vllm.tensor_parallel_size is None:
+                gpu_count = get_gpu_count()
+                log.info(f"Auto-detected {gpu_count} GPUs for vLLM")
+                self.cfg.vllm.tensor_parallel_size = gpu_count
     
     def run(self) -> WorkflowResult:
         """Run the complete workflow using Hydra configuration.

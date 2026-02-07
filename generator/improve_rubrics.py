@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """improve_rubrics.py
 
 Improve rubrics using the prompt template and highest scoring responses.
@@ -8,17 +9,35 @@ for ALL such prompts separately, not just globally highest scores.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import random
+import sys
 import time
 from typing import Dict, List, Any, Optional, Tuple
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
-# Local imports
-from .utils import generate_via_api, fix_json_with_gemini_flash, _strip_leading_think_block
+# ---------------------------------------------------------------------------
+# Local imports – prefer package-relative, fall back to path hack for
+# "python generator/xyz.py" execution.
+# ---------------------------------------------------------------------------
+try:
+    from .utils import generate_via_api, fix_json_with_gemini_flash, _strip_leading_think_block  # type: ignore
+except ImportError:  # pragma: no cover – direct script execution support
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from utils import generate_via_api, fix_json_with_gemini_flash, _strip_leading_think_block  # type: ignore
+
+# vLLM imports (optional)
+try:
+    from vllm import LLM, SamplingParams  # type: ignore
+    VLLM_AVAILABLE = True
+except Exception:
+    VLLM_AVAILABLE = False
+    LLM = None  # type: ignore
+    SamplingParams = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Configuration defaults -----------------------------------------------------
@@ -28,10 +47,105 @@ MAX_TOKENS: Optional[int] = None
 TEMPERATURE: float = 0.0
 RANDOM_SEED: int = 42
 
-# Default prompt file (used in function defaults)
-DEFAULT_PROMPT_FILE = "generator/prompts/improve_rubrics_simplified.txt"
+# Default file paths
+DEFAULT_PROMPT_FILE = "generator/prompts/improve_rubrics.txt"
+DEFAULT_SCORED_DATA = "data/exp2/explicit_rubrics_Policy_Model_Qwen2.5_32B_Instruct_Temperature_1.0_TopP_0.95_1000_Prompts_64_Tesponses_Dataset_OST_gemini_gemini-2.5-flash_all_responses_scored.json"
 
 
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Improve rubrics for all prompts with tied highest scores.",
+    )
+    parser.add_argument(
+        "--prompt-file",
+        type=str,
+        default=DEFAULT_PROMPT_FILE,
+        help="Path to the improvement prompt template (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--scored-data-file",
+        type=str,
+        default=DEFAULT_SCORED_DATA,
+        help="Path to the scored responses JSON file (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--output-file",
+        type=str,
+        default=None,
+        help="Path to the output JSON file (default: auto-generated)",
+    )
+    parser.add_argument(
+        "--previous-rubrics-file",
+        type=str,
+        default=None,
+        help="Path to the previous rubrics file (needed to preserve rubrics for prompts without ties)",
+    )
+    parser.add_argument(
+        "--responses-file", 
+        type=str,
+        default=None,
+        help="Path to the responses file (needed to add prompt text to rubrics)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=RUBRIC_IMPROVER_MODEL,
+        help="Model to use for rubric improvement (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["api", "vllm"],
+        default="api",
+        help="Backend to use: 'api' or 'vllm' (local)",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=TEMPERATURE,
+        help="Temperature for model generation (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=0,
+        help="Max new tokens to generate (0 to use default)",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=16,
+        help="Maximum number of concurrent workers for parallel processing (default: %(default)s)",
+    )
+    # vLLM-specific options
+    parser.add_argument(
+        "--vllm-tensor-parallel-size",
+        type=int,
+        default=None,
+        help="vLLM tensor parallel size (GPUs). If not set, auto-detect",
+    )
+    parser.add_argument(
+        "--vllm-max-model-len",
+        type=int,
+        default=None,
+        help="vLLM max model length",
+    )
+    parser.add_argument(
+        "--vllm-enforce-eager",
+        action="store_true",
+        help="Enable vLLM eager mode",
+    )
+    return parser.parse_args()
+
+
+def generate_output_filename(input_file: str, model: str) -> str:
+    """Generate default output filename based on input file and model."""
+    import os
+    input_dir = os.path.dirname(input_file)
+    input_base = os.path.splitext(os.path.basename(input_file))[0]
+    model_clean = model.replace("/", "_").replace("-", "_")
+    return os.path.join("data/exp2", f"improved_rubrics_{input_base}_{model_clean}.json")
 
 
 def load_json_data(file_path: str) -> Dict:
@@ -101,7 +215,6 @@ def find_prompts_with_tied_highest_scores(scored_data: Dict) -> List[Dict]:
                 "num_tied": len(highest_responses),
                 "selected_responses": selected_responses,
                 "tie_type": "highest_score_tie",
-                "is_force_continue": False,
                 "absolute_highest_score": absolute_highest_score
             })
         else:
@@ -110,107 +223,7 @@ def find_prompts_with_tied_highest_scores(scored_data: Dict) -> List[Dict]:
     return prompts_with_ties
 
 
-def find_highest_scoring_tie_across_prompts(scored_data: Dict) -> List[Dict]:
-    """
-    Find ties at the highest available score level for each prompt.
-    This is used when force_continue is True.
-    
-    For each prompt:
-    - If there are ties at the highest score, use those
-    - If no ties at highest score, find ties at the next highest score level
-    - If no ties at any level, use the top 2 responses
-    """
-    prompts_with_ties = []
-    
-    for result in scored_data["results"]:
-        prompt_id = result["id"]
-        prompt = result["prompt"]
-        rubric = result["rubric"]
-        responses = result["scored_responses"]
-        
-        if len(responses) < 2:
-            # Skip prompts with less than 2 responses
-            print(f"⚠️  PROMPT {prompt_id}: Skipping (only {len(responses)} response)")
-            continue
-        
-        # Get all unique scores to find the absolute highest
-        all_scores = [resp["score"] for resp in responses]
-        absolute_highest_score = max(all_scores) if all_scores else 0
-        
-        # Group responses by score within this prompt
-        score_groups = defaultdict(list)
-        for response in responses:
-            score = response["score"]
-            score_groups[score].append({
-                "prompt": prompt,
-                "rubric": rubric,
-                "response": response["response"],
-                "score_text": response["score_text"],
-                "response_idx": response["response_idx"],
-                "prompt_id": response["prompt_id"],
-                "score": score
-            })
-        
-        # Get unique scores in descending order
-        unique_scores = sorted(score_groups.keys(), reverse=True)
-        
-        # Find the highest score level with ties (at least 2 responses)
-        selected_responses = None
-        selected_score = None
-        tie_type = None
-        
-        for score in unique_scores:
-            if len(score_groups[score]) >= 2:
-                # Found ties at this score level
-                selected_score = score
-                selected_responses = random.sample(score_groups[score], 2)
-                # Determine if this is a tie at the absolute highest score or a lower score
-                if score == absolute_highest_score:
-                    tie_type = "highest_score_tie"
-                    print(f"🔄 PROMPT {prompt_id}: Found {len(score_groups[score])} ties at highest score {score}")
-                else:
-                    tie_type = "lower_score_tie"
-                    print(f"🔄 PROMPT {prompt_id}: Found {len(score_groups[score])} ties at score {score} (highest score: {absolute_highest_score})")
-                break
-        
-        if selected_responses is None:
-            # No ties found at any score level - take top 2 responses
-            all_responses_sorted = sorted(responses, key=lambda x: x["score"], reverse=True)
-            if len(all_responses_sorted) >= 2:
-                top_2 = all_responses_sorted[:2]
-                selected_responses = [
-                    {
-                        "prompt": prompt,
-                        "rubric": rubric,
-                        "response": resp["response"],
-                        "score_text": resp["score_text"],
-                        "response_idx": resp["response_idx"],
-                        "prompt_id": resp["prompt_id"],
-                        "score": resp["score"]
-                    }
-                    for resp in top_2
-                ]
-                selected_score = top_2[0]["score"]
-                tie_type = "no_ties_top_2"
-                print(f"🔄 PROMPT {prompt_id}: No ties found, using top 2 responses (scores: {top_2[0]['score']}, {top_2[1]['score']})")
-        
-        if selected_responses:
-            prompts_with_ties.append({
-                "prompt_id": prompt_id,
-                "prompt": prompt,
-                "rubric": rubric,
-                "highest_score": selected_score,
-                "num_tied": len(selected_responses),
-                "selected_responses": selected_responses,
-                "tie_type": tie_type,
-                "is_force_continue": True,
-                "absolute_highest_score": absolute_highest_score
-            })
-    
-    return prompts_with_ties
-
-
-def _select_top2_per_prompt(scored_data: Dict, *, force_mode: bool) -> List[Dict]:
+def _select_top2_per_prompt(scored_data: Dict) -> List[Dict]:
     """Helper: deterministically select top-2 responses per prompt."""
     results: List[Dict] = []
     for result in scored_data.get("results", []):
@@ -241,7 +254,6 @@ def _select_top2_per_prompt(scored_data: Dict, *, force_mode: bool) -> List[Dict
             "num_tied": 2,
             "selected_responses": selected,
             "tie_type": "top2",
-            "is_force_continue": bool(force_mode),
             "absolute_highest_score": top_2[0]["score"],
         })
     return results
@@ -377,9 +389,14 @@ def improve_rubrics_for_prompt(
     model: str,
     temperature: float,
     existing_criteria_by_id: Dict[str, List[Dict]] = None,
+    backend: str = "api",
+    vllm_instance: Optional[LLM] = None,
     max_tokens: Optional[int] = None,
 ) -> Dict:
-    """Generate improved rubrics for a single prompt with tied responses."""
+    """Generate improved rubrics for a single prompt with tied responses.
+
+    Always uses 'improve' mode for full rubric replacement.
+    """
     
     prompt_id = prompt_info["prompt_id"]
     prompt = prompt_info["prompt"]
@@ -408,19 +425,42 @@ def improve_rubrics_for_prompt(
     improved_rubrics_text = None
     last_error = None
 
-    # Use API backend
-    for attempt in range(max_retries):
+    if backend == "api":
+        for attempt in range(max_retries):
+            try:
+                improved_rubrics_text = generate_via_api(
+                    model,
+                    messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                break
+            except Exception as e:
+                last_error = e
+                print(f"❌ API call failed for prompt {prompt_id} after {max_retries} attempt(s): {e}")
+    else:
+        if not VLLM_AVAILABLE:
+            return {
+                "prompt_id": prompt_id,
+                "original_prompt": prompt,
+                "original_rubrics": rubrics,
+                "response1": response1_data,
+                "response2": response2_data,
+                "improvement_prompt": improvement_prompt,
+                "error": "vLLM not available; install vllm or use --backend api",
+                "success": False,
+            }
         try:
-            improved_rubrics_text = generate_via_api(
-                model,
-                messages,
-                max_tokens=max_tokens,
+            llm = vllm_instance
+            sp = SamplingParams(
                 temperature=temperature,
+                max_tokens=(max_tokens if (isinstance(max_tokens, int) and max_tokens > 0) else 2048),
             )
-            break
+            outputs = llm.chat([messages], sampling_params=sp, use_tqdm=False)
+            improved_rubrics_text = outputs[0].outputs[0].text if outputs and outputs[0].outputs else ""
         except Exception as e:
             last_error = e
-            print(f"❌ API call failed for prompt {prompt_id} after {max_retries} attempt(s): {e}")
+            print(f"❌ vLLM generation failed for prompt {prompt_id}: {e}")
     
     # If all retries failed, return error
     if improved_rubrics_text is None:
@@ -439,7 +479,7 @@ def improve_rubrics_for_prompt(
     try:
         # Clean and robustly extract JSON content
         response_text = _clean_response_and_try_extract_json(improved_rubrics_text)
-        # Parse JSON - improve style: these are the complete criteria (replacing existing)
+        # Parse JSON - always use improve mode (full replacement)
         parsed_criteria = json.loads(response_text)
         new_criteria = parsed_criteria
         all_criteria = parsed_criteria
@@ -472,7 +512,6 @@ def improve_rubrics_for_prompt(
                 "response1_text": response1,
                 "response2_text": response2,
                 "tie_type": prompt_info.get("tie_type", "unknown"),
-                "is_force_continue": prompt_info.get("is_force_continue", False),
                 "absolute_highest_score": prompt_info.get("absolute_highest_score", prompt_info["highest_score"])
             }
         }
@@ -622,15 +661,22 @@ def improve_rubrics(
     rubric_improver_model: str = RUBRIC_IMPROVER_MODEL,
     prompt_template_file: str = DEFAULT_PROMPT_FILE,
     max_workers: int = 16,
-    force_continue: bool = False,
     previous_rubrics_file: str = None,
     selection_strategy: str = "ties",
+    backend: str = "api",
+    vllm_model: Optional[str] = None,
+    vllm_tensor_parallel_size: Optional[int] = None,
+    vllm_max_model_len: Optional[int] = None,
+    vllm_enforce_eager: bool = False,
     temperature: float = TEMPERATURE,
     max_tokens: Optional[int] = MAX_TOKENS,
+    vllm_instance: Optional[LLM] = None,
 ) -> bool:
     """
     API function to improve rubrics using highest scoring responses.
-    
+
+    Always uses 'improve' mode for full rubric replacement.
+
     Args:
         scored_file: Path to scored responses JSON file
         output_file: Path to save improved rubrics
@@ -638,15 +684,14 @@ def improve_rubrics(
         rubric_improver_model: Model to use for rubric improvement
         prompt_template_file: Path to improvement prompt template
         max_workers: Number of parallel workers
-        force_continue: If True, use the highest scoring tie across all prompts as reference
-    
+
     Returns:
         bool: True if successful, False otherwise
     """
     try:
-        # Respect provided prompt_template_file; only set default if none provided
+        # Use default improve template if none provided
         if not prompt_template_file:
-            prompt_template_file = "generator/prompts/improve_rubrics_simplified.txt"
+            prompt_template_file = "generator/prompts/improve_rubrics.txt"
         
         # Load data and template
         scored_data = load_json_data(scored_file)
@@ -665,15 +710,9 @@ def improve_rubrics(
         # Select responses according to selection strategy and force mode
         if selection_strategy == "top2":
             print("Selection strategy: top2 (deterministic top-2 per prompt)")
-            prompts_with_ties = _select_top2_per_prompt(scored_data, force_mode=force_continue)
+            prompts_with_ties = _select_top2_per_prompt(scored_data)
         else:
-            # Default strategy: ties-based selection
-            if force_continue:
-                print("Force continue mode: Using highest scoring tie across all prompts")
-                prompts_with_ties = find_highest_scoring_tie_across_prompts(scored_data)
-            else:
-                # Normal mode: find all prompts with tied highest scores
-                prompts_with_ties = find_prompts_with_tied_highest_scores(scored_data)
+            prompts_with_ties = find_prompts_with_tied_highest_scores(scored_data)
         
         if not prompts_with_ties:
             print("No prompts found with tied highest scores! No improvements needed.")
@@ -686,10 +725,30 @@ def improve_rubrics(
         
         print(f"Found {len(prompts_with_ties)} prompts to improve")
         
+        # Prepare vLLM instance if needed
+        if backend == "vllm":
+            if not VLLM_AVAILABLE:
+                raise ImportError("vLLM is not installed. Please install vLLM or run with backend=api.")
+            if vllm_instance is None:
+                model_name = vllm_model or rubric_improver_model
+                if vllm_tensor_parallel_size is None:
+                    try:
+                        import torch  # type: ignore
+                        vllm_tensor_parallel_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
+                    except Exception:
+                        vllm_tensor_parallel_size = 1
+                llm_kwargs = {
+                    "model": model_name,
+                    "tensor_parallel_size": vllm_tensor_parallel_size,
+                    "dtype": "bfloat16",
+                    "enforce_eager": vllm_enforce_eager,
+                }
+                if vllm_max_model_len is not None:
+                    llm_kwargs["max_model_len"] = vllm_max_model_len
+                vllm_instance = LLM(**llm_kwargs)
 
         improvement_results = []
-        # Always use API backend
-        if False:
+        if backend == "vllm":
             # Batch all prompts into a single vLLM chat call to avoid concurrent NCCL ops
             conversations: List[List[Dict]] = []
             metas: List[Dict] = []
@@ -724,7 +783,7 @@ def improve_rubrics(
                 try:
                     response_text = _clean_response_and_try_extract_json(text)
                     parsed_criteria = json.loads(response_text)
-                    # Improve style: these are the complete criteria (replacing existing)
+                    # Always use improve mode (full replacement)
                     new_criteria = parsed_criteria
                     all_criteria = parsed_criteria
                     for j, criterion in enumerate(all_criteria):
@@ -745,7 +804,6 @@ def improve_rubrics(
                             "response1_text": selected_responses[0]["response"],
                             "response2_text": selected_responses[1]["response"],
                             "tie_type": prompt_info.get("tie_type", "unknown"),
-                            "is_force_continue": prompt_info.get("is_force_continue", False),
                             "absolute_highest_score": prompt_info.get("absolute_highest_score", prompt_info["highest_score"])
                         }
                     }
@@ -767,6 +825,8 @@ def improve_rubrics(
                             rubric_improver_model,
                             temperature,
                             existing_criteria_by_id,
+                            backend,
+                            None,
                             (max_tokens if (isinstance(max_tokens, int) and max_tokens > 0) else None),
                         ): prompt_info for prompt_info in items
                     }
@@ -845,3 +905,49 @@ def improve_rubrics(
         import traceback
         traceback.print_exc()
         return False
+
+
+def main() -> None:
+    """Main workflow execution."""
+    # Set random seed for reproducibility
+    random.seed(RANDOM_SEED)
+    
+    # Parse arguments
+    args = parse_arguments()
+    
+    # Generate default output filename if not specified
+    if args.output_file is None:
+        args.output_file = generate_output_filename(args.scored_data_file, args.model)
+    
+    print(f"📊 Using improvement model: {args.model}")
+    print(f"📊 Temperature: {args.temperature}")
+    print(f"📊 Scored data file: {args.scored_data_file}")
+    print(f"📊 Output file: {args.output_file}")
+    print(f"📊 Max workers: {args.max_workers}")
+    
+    # Use the API function to improve rubrics
+    success = improve_rubrics(
+        scored_file=args.scored_data_file,
+        output_file=args.output_file,
+        sample_size=None,  # No sample size argument in improve_rubrics
+        rubric_improver_model=args.model,
+        prompt_template_file=args.prompt_file,
+        max_workers=args.max_workers,
+        previous_rubrics_file=args.previous_rubrics_file,
+        backend=args.backend,
+        temperature=args.temperature,
+        max_tokens=(None if args.max_tokens == 0 else args.max_tokens),
+    )
+    
+    if success:
+        print("✅ Rubric improvement completed successfully!")
+        print(f"Results saved to: {args.output_file}")
+    else:
+        print("❌ Rubric improvement failed!")
+        return 1
+    
+    return 0
+
+
+if __name__ == "__main__":
+    main()

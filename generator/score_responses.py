@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """score_responses.py
 Score responses using rubrics from a separate file and select best responses.
 Uses maximum parallelism by scoring all responses from all prompts simultaneously.
@@ -5,15 +6,57 @@ Uses maximum parallelism by scoring all responses from all prompts simultaneousl
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import random
 from typing import Dict, List, Optional, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
+# import pandas as pd  # Not used in this code
 from tqdm import tqdm
 
-# Local imports
-from .utils import generate_via_api
+# ---------------------------------------------------------------------------
+# Local imports – prefer package-relative, with fallback for script execution.
+# ---------------------------------------------------------------------------
+import sys
+try:
+    from .utils import generate_via_api  # type: ignore
+except ImportError:  # pragma: no cover
+    print("ImportError: utils.py not found, using path hack")
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from utils import generate_via_api  # type: ignore
+
+
+# Set vLLM environment variable to use v0 API
+os.environ["VLLM_USE_V1"] = "0"
+
+# vLLM imports (imported conditionally)
+try:
+    from vllm import LLM, SamplingParams
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
+    LLM = None
+    SamplingParams = None
+
+# GPU detection
+def get_gpu_count() -> int:
+    """Get the number of available GPUs."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return torch.cuda.device_count()
+        else:
+            return 0
+    except ImportError:
+        # Try alternative methods if PyTorch is not available
+        try:
+            import subprocess
+            result = subprocess.run(['nvidia-smi', '--list-gpus'], 
+                                  capture_output=True, text=True, check=True)
+            return len(result.stdout.strip().split('\n'))
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return 0
 
 
 # ---------------------------------------------------------------------------
@@ -24,8 +67,119 @@ TEMPERATURE: float = 0.0
 RANDOM_SEED: int = 42
 
 
+# ---------------------------------------------------------------------------
+# Argument parsing -----------------------------------------------------------
+# ---------------------------------------------------------------------------
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Score responses using rubrics from a separate file and select best responses.",
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["api", "vllm"],
+        default="vllm",
+        help="Backend to use for scoring: 'api' for API-based scoring, 'vllm' for vLLM batch processing (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--verifier",
+        type=str,
+        default="google/gemma-3-27b-it",
+        help="Model to use for scoring/verification (default: %(default)s)",
+    )
+
+    parser.add_argument(
+        "--vllm-tensor-parallel-size",
+        type=int,
+        default=None,
+        help="Number of GPUs to use for tensor parallelism in vLLM (default: auto-detect all available GPUs)",
+    )
+    parser.add_argument(
+        "--vllm-max-model-len",
+        type=int,
+        default=None,
+        help="Maximum sequence length for vLLM model (default: auto)",
+    )
+    parser.add_argument(
+        "--no-vllm-enforce-eager",
+        action="store_true",
+        default=False,
+        help="Disable vLLM eager mode (enable CUDA graph capture). By default, vLLM runs in eager mode to avoid compatibility issues.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=64,
+        help="Number of parallel worker threads to use for API backend (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=2,
+        help="Maximum number of retry attempts for failed parsing (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--retry-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature to use for retry attempts (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=100,
+        help="Number of prompts to sample from the dataset (default: process all)",
+    )
+    parser.add_argument(
+        "--responses-per-prompt",
+        type=int,
+        default=None,
+        help="Number of responses per prompt to score (default: score all responses)",
+    )
+    parser.add_argument(
+        "--responses-file",
+        type=str,
+        default="data/exp0.3/Policy_Model_Qwen2.5_32B_Instruct_Temperature_1.0_TopP_0.95_1000_Prompts_64_Tesponses_Dataset_OST.json",
+        help="Path to the file containing responses (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--rubrics-file",
+        type=str,
+        default="data/exp2/workflow_results_2025-07-02_23-52-58/final_rubrics.json",
+        help="Path to the file containing parsed rubrics (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output file path (default: auto-generated based on responses file)",
+    )
+    parser.add_argument(
+        "--unweighted",
+        action="store_true",
+        help="Ignore rubric criterion weights and treat each criterion as weight 1",
+    )
+    return parser.parse_args()
 
 
+def generate_output_filename(input_file: str, verifier: str, responses_per_prompt: int = None, backend: str = "api") -> str:
+    """Generate default output filename based on input file and verifier."""
+    input_dir = os.path.dirname(input_file)
+    input_basename = os.path.basename(input_file)
+    
+    # Remove .json extension and add verifier name and _scored_responses.json
+    name_without_ext = os.path.splitext(input_basename)[0]
+    
+    # Sanitize verifier name for filename (replace / with _)
+    verifier_sanitized = verifier.replace("/", "_")
+    
+    # Add backend information to filename
+    backend_suffix = f"_{backend}" if backend != "api" else ""
+    
+    # Add responses per prompt to filename if specified
+    responses_suffix = f"_{responses_per_prompt}responses" if responses_per_prompt else "_all_responses"
+    return os.path.join("data/exp2", f"explicit_rubrics_{name_without_ext}_{verifier_sanitized}{backend_suffix}{responses_suffix}_scored_new.json")
 
 
 def load_json_data(file_path: str) -> List[Dict]:
@@ -400,6 +554,7 @@ def score_single_response_with_prompt_id(args_tuple) -> Dict:
         "final_attempt": max_retries + 1,
     }
 
+
 def collect_rubrics_summary(responses_data: List[Dict], rubrics_data: Dict[str, str]) -> Dict:
     """Collect a summary of all rubrics used across prompts."""
     rubrics_by_prompt = {}
@@ -418,6 +573,29 @@ def collect_rubrics_summary(responses_data: List[Dict], rubrics_data: Dict[str, 
     }
 
 
+# ---------------------------------------------------------------------------
+# vLLM batch processing functions -------------------------------------------
+# ---------------------------------------------------------------------------
+def prepare_vllm_batch_prompts(all_scoring_tasks: List[tuple]) -> List[str]:
+    """Prepare all prompts for vLLM batch processing."""
+    batch_prompts = []
+    for task in all_scoring_tasks:
+        prompt, rubric, response, response_idx, verifier_prompt_template, prompt_id, criteria_by_id, max_retries, retry_temperature, verifier, use_weights = task
+        conv = build_eval_prompt(prompt, rubric, response, verifier_prompt_template)
+        
+        # Convert conversation to a single prompt string
+        # Assuming conv is a list of dicts with 'role' and 'content' keys
+        prompt_text = ""
+        for message in conv:
+            if message["role"] == "user":
+                prompt_text += message["content"]
+            elif message["role"] == "assistant":
+                prompt_text += message["content"]
+        
+        batch_prompts.append(prompt_text)
+    
+    return batch_prompts
+
 
 
 
@@ -432,6 +610,46 @@ def score_responses_with_api(all_scoring_tasks: List[tuple], workers: int) -> Li
     return scored_responses
 
 
+def main() -> None:
+    """Main workflow execution."""
+    # Set random seed for reproducibility
+    random.seed(RANDOM_SEED)
+    
+    # Parse arguments
+    args = parse_arguments()
+    
+    # Generate default output filename if not specified
+    if args.output is None:
+        args.output = generate_output_filename(args.responses_file, args.verifier, args.responses_per_prompt, args.backend)
+    
+    print(f"📊 Using backend: {args.backend}")
+    print(f"📊 Verifier model: {args.verifier}")
+    print(f"📊 Output file: {args.output}")
+    
+    # Use the API function to score responses
+    success = score_responses_api(
+        responses_file=args.responses_file,
+        rubrics_file=args.rubrics_file,
+        output_file=args.output,
+        sample_size=args.sample_size,
+        backend=args.backend,
+        verifier=args.verifier,
+        vllm_instance=None,
+        max_retries=args.max_retries,
+        retry_temperature=args.retry_temperature,
+        tensor_parallel_size=args.vllm_tensor_parallel_size,
+        max_model_len=args.vllm_max_model_len,
+        enforce_eager=not args.no_vllm_enforce_eager,
+        use_weights=not args.unweighted,
+    )
+    
+    if success:
+        print("✅ Response scoring completed successfully!")
+    else:
+        print("❌ Response scoring failed!")
+        return 1
+    
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -442,13 +660,18 @@ def score_responses_direct(
     responses_file: str,
     rubrics_file: str,
     output_file: str,
+    backend: str = "vllm",
     verifier: str = "google/gemma-3-27b-it",
+    vllm_instance: Optional[LLM] = None,
     workers: int = 16,
     max_retries: int = 2,
     retry_temperature: float = 1.0,
     sample_size: Optional[int] = None,
     responses_per_prompt: Optional[int] = None,
     filter_prompt_ids: Optional[List[str]] = None,
+    vllm_tensor_parallel_size: Optional[int] = None,
+    vllm_max_model_len: Optional[int] = None,
+    vllm_enforce_eager: bool = True,
     use_weights: bool = True,
 ) -> bool:
     """
@@ -475,7 +698,7 @@ def score_responses_direct(
         bool: True if successful, False otherwise
     """
     try:
-        print(f"📊 Scoring responses using API backend")
+        print(f"📊 Scoring responses using {backend} backend")
         print(f"📁 Responses file: {responses_file}")
         print(f"📁 Rubrics file: {rubrics_file}")
         print(f"📁 Output file: {output_file}")
@@ -522,8 +745,22 @@ def score_responses_direct(
         total_tasks = len(all_scoring_tasks)
         print(f"📊 Total responses to score: {total_tasks}")
         
-        # Score all responses using API backend
-        scored_responses = score_responses_with_api(all_scoring_tasks, workers)
+        # Score all responses using the selected backend
+        if backend == "api":
+            scored_responses = score_responses_with_api(all_scoring_tasks, workers)
+        elif backend == "vllm":
+            scored_responses = score_responses_with_vllm(
+                all_scoring_tasks,
+                verifier,
+                vllm_instance=vllm_instance,
+                tensor_parallel_size=vllm_tensor_parallel_size,
+                max_model_len=vllm_max_model_len,
+                max_tokens=MAX_TOKENS,
+                temperature=TEMPERATURE,
+                enforce_eager=vllm_enforce_eager,
+            )
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
         
         # Calculate retry statistics
         total_final_successes = sum(1 for resp in scored_responses if resp.get("_parse_success", False))
@@ -653,6 +890,324 @@ def score_responses_direct(
         return False
 
 
+def score_responses_with_vllm(
+    all_scoring_tasks: List[tuple],
+    verifier: str,
+    vllm_instance: Optional[LLM] = None,
+    tensor_parallel_size: int = 1,
+    max_model_len: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    temperature: float = 1.0,
+    enforce_eager: bool = False,
+) -> List[Dict]:
+    """
+    Score all responses using vLLM batch processing with optional pre-initialized instance.
+    
+    Args:
+        all_scoring_tasks: List of scoring tasks
+        verifier: Model name
+        vllm_instance: Pre-initialized vLLM instance (optional)
+        tensor_parallel_size: GPU count (only used if vllm_instance is None)
+        max_model_len: Max sequence length (only used if vllm_instance is None)
+        max_tokens: Max tokens to generate
+        temperature: Sampling temperature
+        enforce_eager: Whether to enforce eager mode (only used if vllm_instance is None)
+    
+    Returns:
+        List of scored responses
+    """
+    if not VLLM_AVAILABLE:
+        raise ImportError("vLLM is not installed. Please install it with: pip install vllm")
+    
+    # Use provided vLLM instance or create new one
+    if vllm_instance is not None:
+        print(f"📊 Using pre-initialized vLLM instance")
+        llm = vllm_instance
+        should_cleanup = False
+    else:
+        print(f"📊 Initializing new vLLM instance with model: {verifier}")
+        llm_kwargs = {
+            "model": verifier,
+            "tensor_parallel_size": tensor_parallel_size,
+            "enforce_eager": enforce_eager,
+            "dtype": "bfloat16",
+        }
+        if max_model_len is not None:
+            llm_kwargs["max_model_len"] = max_model_len
+        
+        llm = LLM(**llm_kwargs)
+        should_cleanup = True
+    
+    # Prepare sampling parameters for initial attempt
+    sampling_params = SamplingParams(
+        temperature=temperature,
+        max_tokens=max_tokens or 2048,
+        stop=None,
+    )
+    
+    # Prepare batch prompts for initial attempt
+    print("📊 Preparing batch prompts for vLLM...")
+    batch_prompts = prepare_vllm_batch_prompts(all_scoring_tasks)
+    
+    print(f"📊 Running vLLM inference on {len(batch_prompts)} prompts...")
+    
+    # Generate responses using vLLM batch processing
+    outputs = llm.generate(batch_prompts, sampling_params)
+    
+    # Process results and collect failed attempts for retry
+    scored_responses = []
+    failed_tasks = []
+    
+    for i, output in enumerate(tqdm(outputs, desc="Processing vLLM outputs")):
+        task = all_scoring_tasks[i]
+        prompt, rubric, response, response_idx, verifier_prompt_template, prompt_id, criteria_by_id, max_retries, retry_temperature, verifier_model, use_weights = task
+        
+        try:
+            # Get the generated text
+            generated_text = output.outputs[0].text
+            
+            # Parse the explicit verifier output and calculate weighted/unweighted score
+            score, debug_info, parsed_answers, parse_success = parse_explicit_verifier_output(
+                generated_text, criteria_by_id, prompt_id, use_weights=use_weights
+            )
+            
+            # Track retry attempts
+            retry_attempts = [{
+                "attempt": 1,
+                "temperature": temperature,
+                "parse_success": parse_success,
+                "score": score,
+                "debug_info": debug_info
+            }]
+            
+            if parse_success:
+                # Success on first attempt
+                scored_responses.append({
+                    "prompt_id": prompt_id,
+                    "response": response,
+                    "response_idx": response_idx,
+                    "score": score,
+                    "score_text": generated_text.strip(),
+                    "debug_info": debug_info,
+                    "parsed_answers": parsed_answers,
+                    "_parse_success": parse_success,
+                    "retry_attempts": retry_attempts,
+                    "final_attempt": 1,
+                })
+            else:
+                # Failed on first attempt, add to retry list
+                if max_retries > 0:
+                    failed_tasks.append({
+                        "task": task,
+                        "task_index": i,
+                        "retry_attempts": retry_attempts,
+                        "last_score_text": generated_text.strip()
+                    })
+                    print(f"RETRY: Initial attempt failed for {prompt_id}:{response_idx}, will retry with temperature {retry_temperature}")
+                    if debug_info:
+                        print(f"  Debug info: {debug_info}")
+                else:
+                    # No retries allowed
+                    scored_responses.append({
+                        "prompt_id": prompt_id,
+                        "response": response,
+                        "response_idx": response_idx,
+                        "score": score,
+                        "score_text": generated_text.strip(),
+                        "debug_info": debug_info,
+                        "parsed_answers": parsed_answers,
+                        "_parse_success": parse_success,
+                        "retry_attempts": retry_attempts,
+                        "final_attempt": 1,
+                    })
+                    print(f"FAILED: No retries allowed for {prompt_id}:{response_idx}")
+            
+        except Exception as e:
+            print(f"DEBUG: Exception in processing vLLM output for {prompt_id}:{response_idx}: {e}")
+            
+            # Track retry attempts for exception case
+            retry_attempts = [{
+                "attempt": 1,
+                "temperature": temperature,
+                "parse_success": False,
+                "score": 0,
+                "debug_info": f"Exception during vLLM processing: {e}",
+                "exception": str(e)
+            }]
+            
+            if max_retries > 0:
+                failed_tasks.append({
+                    "task": task,
+                    "task_index": i,
+                    "retry_attempts": retry_attempts,
+                    "last_score_text": f"Error: {e}"
+                })
+                print(f"RETRY: Exception on initial attempt for {prompt_id}:{response_idx}, will retry")
+            else:
+                scored_responses.append({
+                    "prompt_id": prompt_id,
+                    "response": response,
+                    "response_idx": response_idx,
+                    "score": 0,
+                    "score_text": f"Error: {e}",
+                    "debug_info": f"Exception during vLLM processing: {e}",
+                    "parsed_answers": {},
+                    "_parse_success": False,
+                    "retry_attempts": retry_attempts,
+                    "final_attempt": 1,
+                })
+    
+    # Handle retries for failed tasks
+    if failed_tasks:
+        print(f"📊 Processing {len(failed_tasks)} failed tasks for retry...")
+        
+        # Prepare retry sampling parameters with higher temperature
+        retry_sampling_params = SamplingParams(
+            temperature=retry_temperature,
+            max_tokens=max_tokens or 2048,
+            stop=None,
+        )
+        
+        # Process retries
+        for retry_attempt in range(2, max_retries + 2):  # Start from attempt 2
+            if not failed_tasks:
+                break
+                
+            print(f"📊 Retry attempt {retry_attempt} for {len(failed_tasks)} failed tasks...")
+            
+            # Prepare batch prompts for retry
+            retry_batch_prompts = []
+            for failed_task in failed_tasks:
+                task = failed_task["task"]
+                prompt, rubric, response, response_idx, verifier_prompt_template, prompt_id, criteria_by_id, max_retries, retry_temperature, verifier_model, use_weights = task
+                conv = build_eval_prompt(prompt, rubric, response, verifier_prompt_template)
+                
+                # Convert conversation to a single prompt string
+                prompt_text = ""
+                for message in conv:
+                    if message["role"] == "user":
+                        prompt_text += message["content"]
+                    elif message["role"] == "assistant":
+                        prompt_text += message["content"]
+                
+                retry_batch_prompts.append(prompt_text)
+            
+            # Generate retry responses
+            retry_outputs = llm.generate(retry_batch_prompts, retry_sampling_params)
+            
+            # Process retry results
+            still_failed_tasks = []
+            for j, retry_output in enumerate(retry_outputs):
+                failed_task = failed_tasks[j]
+                task = failed_task["task"]
+                prompt, rubric, response, response_idx, verifier_prompt_template, prompt_id, criteria_by_id, max_retries, retry_temperature, verifier_model, use_weights = task
+                
+                try:
+                    # Get the generated text
+                    generated_text = retry_output.outputs[0].text
+                    
+                    # Parse the explicit verifier output and calculate weighted/unweighted score
+                    score, debug_info, parsed_answers, parse_success = parse_explicit_verifier_output(
+                        generated_text, criteria_by_id, prompt_id, use_weights=use_weights
+                    )
+                    
+                    # Add this retry attempt to the history
+                    failed_task["retry_attempts"].append({
+                        "attempt": retry_attempt,
+                        "temperature": retry_temperature,
+                        "parse_success": parse_success,
+                        "score": score,
+                        "debug_info": debug_info
+                    })
+                    
+                    if parse_success:
+                        # Success on retry attempt
+                        print(f"SUCCESS: Retry attempt {retry_attempt} succeeded for {prompt_id}:{response_idx}")
+                        scored_responses.append({
+                            "prompt_id": prompt_id,
+                            "response": response,
+                            "response_idx": response_idx,
+                            "score": score,
+                            "score_text": generated_text.strip(),
+                            "debug_info": debug_info,
+                            "parsed_answers": parsed_answers,
+                            "_parse_success": parse_success,
+                            "retry_attempts": failed_task["retry_attempts"],
+                            "final_attempt": retry_attempt,
+                        })
+                    else:
+                        # Still failed, check if we have more retries
+                        if retry_attempt < max_retries + 1:
+                            still_failed_tasks.append({
+                                "task": task,
+                                "task_index": failed_task["task_index"],
+                                "retry_attempts": failed_task["retry_attempts"],
+                                "last_score_text": generated_text.strip()
+                            })
+                            print(f"RETRY: Attempt {retry_attempt} failed for {prompt_id}:{response_idx}, will retry again")
+                            if debug_info:
+                                print(f"  Debug info: {debug_info}")
+                        else:
+                            # No more retries, mark as final failure
+                            print(f"FAILED: All {max_retries + 1} attempts failed for {prompt_id}:{response_idx}")
+                            scored_responses.append({
+                                "prompt_id": prompt_id,
+                                "response": response,
+                                "response_idx": response_idx,
+                                "score": 0,
+                                "score_text": f"All {max_retries + 1} attempts failed",
+                                "debug_info": f"All {max_retries + 1} attempts failed to parse",
+                                "parsed_answers": {},
+                                "_parse_success": False,
+                                "retry_attempts": failed_task["retry_attempts"],
+                                "final_attempt": retry_attempt,
+                            })
+                
+                except Exception as e:
+                    print(f"DEBUG: Exception in retry attempt {retry_attempt} for {prompt_id}:{response_idx}: {e}")
+                    
+                    # Add this failed retry attempt to the history
+                    failed_task["retry_attempts"].append({
+                        "attempt": retry_attempt,
+                        "temperature": retry_temperature,
+                        "parse_success": False,
+                        "score": 0,
+                        "debug_info": f"Exception during retry: {e}",
+                        "exception": str(e)
+                    })
+                    
+                    if retry_attempt < max_retries + 1:
+                        still_failed_tasks.append({
+                            "task": task,
+                            "task_index": failed_task["task_index"],
+                            "retry_attempts": failed_task["retry_attempts"],
+                            "last_score_text": f"Error: {e}"
+                        })
+                        print(f"RETRY: Exception on retry attempt {retry_attempt} for {prompt_id}:{response_idx}, will retry again")
+                    else:
+                        # No more retries, mark as final failure
+                        print(f"FAILED: All attempts failed with exceptions for {prompt_id}:{response_idx}")
+                        scored_responses.append({
+                            "prompt_id": prompt_id,
+                            "response": response,
+                            "response_idx": response_idx,
+                            "score": 0,
+                            "score_text": f"All {max_retries + 1} attempts failed",
+                            "debug_info": f"All {max_retries + 1} attempts failed with exceptions",
+                            "parsed_answers": {},
+                            "_parse_success": False,
+                            "retry_attempts": failed_task["retry_attempts"],
+                            "final_attempt": retry_attempt,
+                        })
+            
+            # Update failed tasks list for next iteration
+            failed_tasks = still_failed_tasks
+    
+    # Clean up vLLM resources only if we created the instance
+    if should_cleanup:
+        del llm
+    
+    return scored_responses
 
 
 def score_responses(
@@ -660,9 +1215,14 @@ def score_responses(
     rubrics_file: str,
     output_file: str,
     sample_size: Optional[int] = None,
+    backend: str = "vllm",
     verifier: str = "google/gemma-3-27b-it",
+    vllm_instance: Optional[LLM] = None,
     max_retries: int = 2,
     retry_temperature: float = 1.0,
+    tensor_parallel_size: Optional[int] = None,
+    max_model_len: Optional[int] = None,
+    enforce_eager: bool = True,
     use_weights: bool = True,
 ) -> bool:
     """
@@ -689,13 +1249,21 @@ def score_responses(
         responses_file=responses_file,
         rubrics_file=rubrics_file,
         output_file=output_file,
+        backend=backend,
         verifier=verifier,
+        vllm_instance=vllm_instance,
         workers=128,
         max_retries=max_retries,
         retry_temperature=retry_temperature,
         sample_size=sample_size,
         responses_per_prompt=None,
         filter_prompt_ids=None,
+        vllm_tensor_parallel_size=tensor_parallel_size,
+        vllm_max_model_len=max_model_len,
+        vllm_enforce_eager=enforce_eager,
         use_weights=use_weights,
     )
 
+
+if __name__ == "__main__":
+    main() 

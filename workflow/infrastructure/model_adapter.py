@@ -1,7 +1,7 @@
 """Adapter for external model integrations."""
 
 import logging
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 from pathlib import Path
 
 from workflow.core.interfaces import RubricGenerator, ResponseScorer
@@ -16,8 +16,21 @@ class ModelAdapter(RubricGenerator, ResponseScorer):
     our domain interfaces.
     """
     
-    def __init__(self):
-        """Initialize model adapter."""
+    def __init__(
+        self,
+        backend: str = "vllm",
+        gpu_config: Optional[Dict] = None,
+        api_config: Optional[Dict] = None
+    ):
+        """Initialize model adapter.
+
+        Args:
+            backend: Model backend to use ("vllm" or "api")
+            gpu_config: GPU configuration for vLLM backend
+        """
+        self.backend = backend
+        self.gpu_config = gpu_config or {}
+        self.api_config = api_config or {}
         self._generator = None
         self._initialized = False
     
@@ -57,9 +70,10 @@ class ModelAdapter(RubricGenerator, ResponseScorer):
             temp_output_file = f.name
         
         try:
+            worker_count = self.api_config.get('workers') or 64
             # Call generator method
             print("Generating rubrics without responses...")
-            # Choose prompt template for generation based on adapter flag
+            # Always use simplified prompt template
             prompt_template_file = "generator/prompts/generate_rubrics_without_responses_simplified.txt"
 
             success = self._generator._generate_rubrics_without_responses(
@@ -68,6 +82,12 @@ class ModelAdapter(RubricGenerator, ResponseScorer):
                 sample_size=None,
                 rubric_generator=model,
                 prompt_template_file=prompt_template_file,
+                max_workers=worker_count,
+                backend=self.backend,
+                vllm_tensor_parallel_size=(self.gpu_config.get('tensor_parallel_size') if self.gpu_config else None),
+                vllm_max_model_len=(self.gpu_config.get('max_model_len') if self.gpu_config else None),
+                vllm_enforce_eager=(self.gpu_config.get('enforce_eager') if self.gpu_config else False),
+                max_retries=self.api_config.get('max_retries', 2),
             )
             
             if not success:
@@ -93,30 +113,32 @@ class ModelAdapter(RubricGenerator, ResponseScorer):
         self,
         scored_responses: Dict,
         current_rubrics: Dict[str, Dict],
-        model: str
+        model: str,
+        selection_strategy: str = "top2"
     ) -> Dict[str, Dict]:
         """Improve rubrics based on scoring results.
-        
+
         Args:
             scored_responses: Scored response data
             current_rubrics: Current rubrics
             model: Model name to use for improvement
-            
+            selection_strategy: Strategy for selecting reference responses (should be "top2")
+
         Returns:
             Dictionary mapping prompt_id to improved rubric
         """
         self._ensure_generator()
-        
+
         import tempfile
         import json
-        
+
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             json.dump(scored_responses, f)
             temp_scored_file = f.name
-        
+
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             temp_output_file = f.name
-        
+
         # Save current rubrics to temp file
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             # Format current rubrics in the expected structure
@@ -125,21 +147,24 @@ class ModelAdapter(RubricGenerator, ResponseScorer):
             }
             json.dump(rubrics_data, f)
             temp_rubrics_file = f.name
-        
+
         try:
-            # Use the simplified prompt template
+            # Always use improve mode with simplified prompt template
             prompt_template_file = "generator/prompts/improve_rubrics_simplified.txt"
 
-            # Call generator method with fixed values
+            # Call generator method (style is hardcoded to "improve" in the generator)
             self._generator._improve_rubrics(
                 scored_file=temp_scored_file,
                 output_file=temp_output_file,
                 sample_size=None,
                 rubric_improver_model=model,
-                prompt_template_file=(prompt_template_file if prompt_template_file else "generator/prompts/improve_rubrics_simplified.txt"),
-                force_continue=True,  # Always true
+                prompt_template_file=prompt_template_file,
                 previous_rubrics_file=temp_rubrics_file,
-                selection_strategy="top2",  # Always top2
+                selection_strategy=selection_strategy,
+                backend=self.backend,
+                vllm_tensor_parallel_size=(self.gpu_config.get('tensor_parallel_size') if self.gpu_config else None),
+                vllm_max_model_len=(self.gpu_config.get('max_model_len') if self.gpu_config else None),
+                vllm_enforce_eager=(self.gpu_config.get('enforce_eager') if self.gpu_config else False),
             )
             
             # Load and parse results
@@ -180,8 +205,16 @@ class ModelAdapter(RubricGenerator, ResponseScorer):
         import tempfile
         import json
         
-        # Always use API backend, just set the verifier model
-        self._generator.verifier_model = model
+        # Initialize verifier if using vLLM
+        if self.backend == "vllm" and (not hasattr(self._generator, 'vllm_instance') or self._generator.vllm_instance is None):
+            self._generator._initialize_verifier(
+                model=model,
+                tensor_parallel_size=self.gpu_config.get('tensor_parallel_size'),
+                max_model_len=self.gpu_config.get('max_model_len', 2048)
+            )
+        elif self.backend == "api":
+            # For API backend, just set the verifier model
+            self._generator.verifier_model = model
         
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             json.dump(responses, f)
@@ -203,8 +236,9 @@ class ModelAdapter(RubricGenerator, ResponseScorer):
                 output_file=temp_output_file,
                 sample_size=None,
                 rubrics_file=temp_rubrics_file,
-                max_retries=2,
-                retry_temperature=1.0
+                backend=self.backend,
+                max_retries=self.api_config.get('max_retries', 2),
+                retry_temperature=self.api_config.get('retry_temperature', 1.0)
             )
             
             # Load and return results
@@ -218,7 +252,7 @@ class ModelAdapter(RubricGenerator, ResponseScorer):
             Path(temp_output_file).unlink(missing_ok=True) 
 
     def cleanup(self) -> None:
-        """Clean up resources."""
+        """Clean up resources, especially the vLLM instance."""
         if self._initialized and self._generator is not None:
             log.info("Cleaning up model adapter resources")
             if hasattr(self._generator, 'cleanup'):

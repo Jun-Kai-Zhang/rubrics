@@ -20,15 +20,17 @@ class RubricGenerator(Protocol):
         self,
         scored_responses: Dict,
         current_rubrics: Dict[str, Dict],
-        model: str
+        model: str,
+        selection_strategy: str = "top2"
     ) -> Dict[str, Dict]:
         """Improve rubrics based on scoring results.
-        
+
         Args:
             scored_responses: Scored response data
             current_rubrics: Current rubrics by prompt_id
             model: Model name to use for improvement
-            
+            selection_strategy: Strategy for selecting reference responses
+
         Returns:
             Dictionary mapping prompt_id to improved rubric
         """
