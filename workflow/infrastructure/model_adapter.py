@@ -1,8 +1,16 @@
-"""Adapter for external model integrations."""
+"""Adapter for external model integrations.
 
+Routes all model calls through an OpenAI-compatible HTTP API.  When
+``backend="vllm"``, a :class:`VLLMServer` is launched automatically and its
+URL is used as ``base_url``.  When ``backend="api"`` the configured litellm
+proxy URL (or default) is used instead.
+"""
+
+import json
 import logging
-from typing import Dict, List, Optional
+import tempfile
 from pathlib import Path
+from typing import Dict, List, Optional
 
 from workflow.core.interfaces import RubricGenerator, ResponseScorer
 
@@ -10,252 +18,240 @@ log = logging.getLogger(__name__)
 
 
 class ModelAdapter(RubricGenerator, ResponseScorer):
-    """Adapter for external model operations.
-    
-    This adapter wraps the external generator package to implement
-    our domain interfaces.
+    """Adapter that delegates to generator functions via HTTP API.
+
+    Parameters
+    ----------
+    backend:
+        ``"api"`` to use a litellm proxy, ``"vllm"`` to auto-start a local
+        vLLM OpenAI-compatible server.
+    vllm_config:
+        Configuration forwarded to :class:`VLLMServer` when *backend* is
+        ``"vllm"``.  Keys: ``tensor_parallel_size``, ``max_model_len``,
+        ``enforce_eager``, ``gpu_memory_utilization``, ``port``.
+    api_config:
+        API-related settings.  ``base_url`` overrides the default litellm
+        URL; ``workers``, ``max_retries``, ``retry_temperature`` control
+        request behaviour.
     """
-    
+
     def __init__(
         self,
-        backend: str = "vllm",
-        gpu_config: Optional[Dict] = None,
-        api_config: Optional[Dict] = None
+        backend: str = "api",
+        vllm_config: Optional[Dict] = None,
+        api_config: Optional[Dict] = None,
     ):
-        """Initialize model adapter.
-
-        Args:
-            backend: Model backend to use ("vllm" or "api")
-            gpu_config: GPU configuration for vLLM backend
-        """
         self.backend = backend
-        self.gpu_config = gpu_config or {}
+        self.vllm_config = vllm_config or {}
         self.api_config = api_config or {}
-        self._generator = None
-        self._initialized = False
-    
-    def _ensure_generator(self) -> None:
-        """Lazily initialize the generator."""
-        if not self._initialized:
-            # Import here to avoid circular dependencies
-            from generator.rubrics_generator import RubricsGenerator
-            self._generator = RubricsGenerator()
-            self._initialized = True
-    
+
+        self._vllm_server = None  # VLLMServer instance (if any)
+        self._base_url: Optional[str] = self.api_config.get("base_url")
+
+    # ------------------------------------------------------------------
+    # vLLM server lifecycle
+    # ------------------------------------------------------------------
+
+    def _ensure_vllm_server(self, model: str) -> None:
+        """Start (or restart) the vLLM server for *model* if needed."""
+        if self._vllm_server is not None and self._vllm_server.model == model:
+            return  # already running with the right model
+
+        # Stop any existing server first
+        if self._vllm_server is not None:
+            self._vllm_server.stop()
+            self._vllm_server = None
+
+        from generator.vllm_server import VLLMServer
+
+        server = VLLMServer(
+            model=model,
+            port=self.vllm_config.get("port", 8000),
+            tensor_parallel_size=self.vllm_config.get("tensor_parallel_size", 1),
+            max_model_len=self.vllm_config.get("max_model_len"),
+            enforce_eager=self.vllm_config.get("enforce_eager", False),
+            gpu_memory_utilization=self.vllm_config.get(
+                "gpu_memory_utilization", 0.9
+            ),
+        )
+        server.start()
+        self._vllm_server = server
+        self._base_url = server.base_url
+
+    def _get_base_url(self, model: str) -> Optional[str]:
+        """Return the API base URL, starting a vLLM server if needed."""
+        if self.backend == "vllm":
+            self._ensure_vllm_server(model)
+        return self._base_url
+
+    # ------------------------------------------------------------------
+    # RubricGenerator interface
+    # ------------------------------------------------------------------
+
     def generate_initial_rubrics(
         self,
         responses: List[Dict],
-        model: str
+        model: str,
     ) -> Dict[str, Dict]:
-        """Generate initial rubrics from responses.
-        
-        Args:
-            responses: List of response data
-            model: Model name to use for generation
-            
-        Returns:
-            Dictionary mapping prompt_id to rubric
-        """
-        self._ensure_generator()
-        
-        # Create temporary file for responses
-        import tempfile
-        import json
-        
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(responses, f)
-            temp_responses_file = f.name
-        
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            temp_output_file = f.name
-        
-        try:
-            worker_count = self.api_config.get('workers') or 64
-            # Call generator method
-            print("Generating rubrics without responses...")
-            # Always use simplified prompt template
-            prompt_template_file = "generator/prompts/generate_rubrics_without_responses_simplified.txt"
+        """Generate initial rubrics from prompts.
 
-            success = self._generator._generate_rubrics_without_responses(
-                prompts_file=temp_responses_file,
-                output_file=temp_output_file,
+        Returns a dict mapping ``prompt_id → rubric``.
+        """
+        from generator.generate_rubrics import generate_rubrics
+
+        base_url = self._get_base_url(model)
+        worker_count = self.api_config.get("workers") or 64
+        prompt_template_file = (
+            "generator/prompts/generate_rubrics.txt"
+        )
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as f:
+            json.dump(responses, f)
+            temp_prompts = f.name
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as f:
+            temp_output = f.name
+
+        try:
+            print("Generating rubrics...")
+            success = generate_rubrics(
+                prompts_file=temp_prompts,
+                output_file=temp_output,
                 sample_size=None,
                 rubric_generator=model,
                 prompt_template_file=prompt_template_file,
                 max_workers=worker_count,
-                backend=self.backend,
-                vllm_tensor_parallel_size=(self.gpu_config.get('tensor_parallel_size') if self.gpu_config else None),
-                vllm_max_model_len=(self.gpu_config.get('max_model_len') if self.gpu_config else None),
-                vllm_enforce_eager=(self.gpu_config.get('enforce_eager') if self.gpu_config else False),
-                max_retries=self.api_config.get('max_retries', 2),
+                max_retries=self.api_config.get("max_retries", 2),
+                base_url=base_url,
             )
-            
             if not success:
                 raise RuntimeError("Failed to generate initial rubrics")
-            
-            # Load and parse results
-            with open(temp_output_file, 'r') as f:
+
+            with open(temp_output, "r") as f:
                 data = json.load(f)
-            
-            # Convert to dict format
-            rubrics_dict = {}
-            for rubric in data.get("rubrics", []):
-                rubrics_dict[rubric["id"]] = rubric
-            
-            return rubrics_dict
-            
+
+            return {r["id"]: r for r in data}
         finally:
-            # Cleanup temp files
-            Path(temp_responses_file).unlink(missing_ok=True)
-            Path(temp_output_file).unlink(missing_ok=True)
-    
+            Path(temp_prompts).unlink(missing_ok=True)
+            Path(temp_output).unlink(missing_ok=True)
+
     def improve_rubrics(
         self,
         scored_responses: Dict,
         current_rubrics: Dict[str, Dict],
         model: str,
-        selection_strategy: str = "top2"
     ) -> Dict[str, Dict]:
         """Improve rubrics based on scoring results.
 
-        Args:
-            scored_responses: Scored response data
-            current_rubrics: Current rubrics
-            model: Model name to use for improvement
-            selection_strategy: Strategy for selecting reference responses (should be "top2")
-
-        Returns:
-            Dictionary mapping prompt_id to improved rubric
+        Returns a dict mapping ``prompt_id → improved rubric``.
         """
-        self._ensure_generator()
+        from generator.improve_rubrics import improve_rubrics
 
-        import tempfile
-        import json
+        base_url = self._get_base_url(model)
+        prompt_template_file = "generator/prompts/improve_rubrics.txt"
 
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as f:
             json.dump(scored_responses, f)
-            temp_scored_file = f.name
+            temp_scored = f.name
 
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            temp_output_file = f.name
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as f:
+            temp_output = f.name
 
-        # Save current rubrics to temp file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            # Format current rubrics in the expected structure
-            rubrics_data = {
-                "rubrics": list(current_rubrics.values())
-            }
-            json.dump(rubrics_data, f)
-            temp_rubrics_file = f.name
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as f:
+            json.dump(list(current_rubrics.values()), f)
+            temp_rubrics = f.name
 
         try:
-            # Always use improve mode with simplified prompt template
-            prompt_template_file = "generator/prompts/improve_rubrics_simplified.txt"
-
-            # Call generator method (style is hardcoded to "improve" in the generator)
-            self._generator._improve_rubrics(
-                scored_file=temp_scored_file,
-                output_file=temp_output_file,
+            improve_rubrics(
+                scored_file=temp_scored,
+                output_file=temp_output,
                 sample_size=None,
                 rubric_improver_model=model,
                 prompt_template_file=prompt_template_file,
-                previous_rubrics_file=temp_rubrics_file,
-                selection_strategy=selection_strategy,
-                backend=self.backend,
-                vllm_tensor_parallel_size=(self.gpu_config.get('tensor_parallel_size') if self.gpu_config else None),
-                vllm_max_model_len=(self.gpu_config.get('max_model_len') if self.gpu_config else None),
-                vllm_enforce_eager=(self.gpu_config.get('enforce_eager') if self.gpu_config else False),
+                previous_rubrics_file=temp_rubrics,
+                base_url=base_url,
             )
-            
-            # Load and parse results
-            with open(temp_output_file, 'r') as f:
+
+            with open(temp_output, "r") as f:
                 data = json.load(f)
-            
-            # Convert to dict format
-            improved_dict = {}
-            for rubric in data.get("rubrics", []):
-                improved_dict[rubric["id"]] = rubric
-            
-            return improved_dict
-            
+
+            return {r["id"]: r for r in data}
         finally:
-            # Cleanup temp files
-            Path(temp_scored_file).unlink(missing_ok=True)
-            Path(temp_output_file).unlink(missing_ok=True)
-            Path(temp_rubrics_file).unlink(missing_ok=True)
-    
+            Path(temp_scored).unlink(missing_ok=True)
+            Path(temp_output).unlink(missing_ok=True)
+            Path(temp_rubrics).unlink(missing_ok=True)
+
+    # ------------------------------------------------------------------
+    # ResponseScorer interface
+    # ------------------------------------------------------------------
+
     def score_responses(
         self,
         responses: List[Dict],
         rubrics: Dict[str, Dict],
-        model: str
+        model: str,
     ) -> Dict:
         """Score responses using rubrics.
-        
-        Args:
-            responses: List of response data
-            rubrics: Dictionary of rubrics by prompt_id
-            model: Model name to use for scoring
-            
-        Returns:
-            Scored response data
+
+        Returns the scored response data structure.
         """
-        self._ensure_generator()
-        
-        import tempfile
-        import json
-        
-        # Initialize verifier if using vLLM
-        if self.backend == "vllm" and (not hasattr(self._generator, 'vllm_instance') or self._generator.vllm_instance is None):
-            self._generator._initialize_verifier(
-                model=model,
-                tensor_parallel_size=self.gpu_config.get('tensor_parallel_size'),
-                max_model_len=self.gpu_config.get('max_model_len', 2048)
-            )
-        elif self.backend == "api":
-            # For API backend, just set the verifier model
-            self._generator.verifier_model = model
-        
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        from generator.score_responses import score_responses
+
+        base_url = self._get_base_url(model)
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as f:
             json.dump(responses, f)
-            temp_responses_file = f.name
-        
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            # Convert rubrics dict to list format
-            rubrics_list = list(rubrics.values())
-            json.dump({"rubrics": rubrics_list}, f)
-            temp_rubrics_file = f.name
-        
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            temp_output_file = f.name
-        
+            temp_responses = f.name
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as f:
+            json.dump(list(rubrics.values()), f)
+            temp_rubrics = f.name
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as f:
+            temp_output = f.name
+
         try:
-            # Call generator method
-            self._generator._score_responses(
-                responses_file=temp_responses_file,
-                output_file=temp_output_file,
+            score_responses(
+                responses_file=temp_responses,
+                rubrics_file=temp_rubrics,
+                output_file=temp_output,
                 sample_size=None,
-                rubrics_file=temp_rubrics_file,
-                backend=self.backend,
-                max_retries=self.api_config.get('max_retries', 2),
-                retry_temperature=self.api_config.get('retry_temperature', 1.0)
+                verifier=model,
+                max_retries=self.api_config.get("max_retries", 2),
+                retry_temperature=self.api_config.get("retry_temperature", 1.0),
+                base_url=base_url,
             )
-            
-            # Load and return results
-            with open(temp_output_file, 'r') as f:
+
+            with open(temp_output, "r") as f:
                 return json.load(f)
-            
         finally:
-            # Cleanup temp files
-            Path(temp_responses_file).unlink(missing_ok=True)
-            Path(temp_rubrics_file).unlink(missing_ok=True)
-            Path(temp_output_file).unlink(missing_ok=True) 
+            Path(temp_responses).unlink(missing_ok=True)
+            Path(temp_rubrics).unlink(missing_ok=True)
+            Path(temp_output).unlink(missing_ok=True)
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
 
     def cleanup(self) -> None:
-        """Clean up resources, especially the vLLM instance."""
-        if self._initialized and self._generator is not None:
-            log.info("Cleaning up model adapter resources")
-            if hasattr(self._generator, 'cleanup'):
-                self._generator.cleanup()
-            self._generator = None
-            self._initialized = False 
+        """Stop the vLLM server (if one was started)."""
+        if self._vllm_server is not None:
+            log.info("Stopping vLLM server")
+            self._vllm_server.stop()
+            self._vllm_server = None

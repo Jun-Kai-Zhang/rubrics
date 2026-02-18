@@ -3,23 +3,19 @@
 from .interfaces import (
     RubricGenerator,
     ResponseScorer,
-    TieAnalyzer,
     WorkflowOrchestrator
 )
 
 from .services import (
     RubricService,
-    TieAnalysisService
 )
 
 __all__ = [
     # Interfaces
     "RubricGenerator",
-    "ResponseScorer", 
-    "TieAnalyzer",
+    "ResponseScorer",
     "WorkflowOrchestrator",
-    
+
     # Services
     "RubricService",
-    "TieAnalysisService"
-] 
+]

@@ -4,8 +4,8 @@ import logging
 import time
 from typing import Dict, List, Tuple
 
-from workflow.data_structures import IterationInfo, TieAnalysis
-from workflow.core.services import RubricService, TieAnalysisService
+from workflow.data_structures import IterationInfo
+from workflow.core.services import RubricService
 from workflow.core.interfaces import RubricGenerator, ResponseScorer
 from workflow.infrastructure import FileHandler
 
@@ -14,23 +14,21 @@ log = logging.getLogger(__name__)
 
 class IterationManager:
     """Manages the execution of a single workflow iteration."""
-    
+
     def __init__(
         self,
         rubric_generator: RubricGenerator,
         response_scorer: ResponseScorer,
         rubric_service: RubricService,
-        tie_analysis_service: TieAnalysisService,
         file_handler: FileHandler,
         output_dir: str
     ):
         self.rubric_generator = rubric_generator
         self.response_scorer = response_scorer
         self.rubric_service = rubric_service
-        self.tie_analysis_service = tie_analysis_service
         self.file_handler = file_handler
         self.output_dir = output_dir
-    
+
     def run_iteration(
         self,
         iteration_num: int,
@@ -38,30 +36,30 @@ class IterationManager:
         current_rubrics: Dict[str, Dict],
         prompt_ids: List[str],
         config: Dict
-    ) -> Tuple[IterationInfo, TieAnalysis, Dict[str, Dict], Dict[str, Dict]]:
+    ) -> Tuple[IterationInfo, Dict[str, float], Dict[str, Dict], Dict[str, Dict]]:
         """Run a single iteration of the workflow.
-        
+
         Args:
             iteration_num: Current iteration number
             responses: Response data by prompt_id
             current_rubrics: Current rubrics by prompt_id
             prompt_ids: List of prompt IDs to process
             config: Configuration settings
-            
+
         Returns:
-            Tuple of (iteration_info, tie_analysis, updated_rubrics, next_responses)
+            Tuple of (iteration_info, highest_scores_by_prompt,
+                       updated_rubrics, next_responses)
         """
         log.info(f"Running iteration {iteration_num}")
-        
-        # Create iteration info
+
         iter_info = IterationInfo(
             iteration=iteration_num,
             responses_per_prompt=config.get('responses_per_prompt', 64),
             sample_size=len(prompt_ids),
             start_time=time.strftime("%Y-%m-%d_%H-%M-%S")
         )
-        
-        # Prepare all responses for scoring (no capping or sampling)
+
+        # Prepare all responses for scoring
         responses_list = self._prepare_responses_for_scoring(responses, prompt_ids)
 
         # Score all responses
@@ -74,54 +72,26 @@ class IterationManager:
 
         # Save scored responses for this iteration
         scored_responses_file = f"{self.output_dir}/iteration_{iteration_num:02d}_scored_responses.json"
-        self.file_handler.save_json({
-            "metadata": {
-                "iteration": iteration_num,
-                "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
-                "verifier_model": config['verifier_model'],
-                "total_prompts": len(scored_data)
-            },
-            "scored_responses": scored_data
-        }, scored_responses_file)
+        self.file_handler.save_json(scored_data, scored_responses_file)
         log.info(f"Saved scored responses to {scored_responses_file}")
 
-        # Analyze ties
-        log.info("Analyzing ties...")
-        tie_analysis = self.tie_analysis_service.analyze_scored_responses(
-            scored_data=scored_data,
-            prompt_ids_to_analyze=set(prompt_ids)
-        )
-        
-        # Update iteration info with tie analysis results
-        iter_info.has_ties = tie_analysis.has_ties
-        iter_info.prompt_ids_with_ties = tie_analysis.prompt_ids_with_ties
-        iter_info.prompt_ids_without_ties = tie_analysis.prompt_ids_without_ties
-        iter_info.ties_per_prompt = tie_analysis.ties_per_prompt
-        
-        # Log detailed resolution status
-        if tie_analysis.prompt_ids_without_ties:
-            log.info(f"📊 Prompts resolved (no ties) in this iteration: {len(tie_analysis.prompt_ids_without_ties)}")
-            for prompt_id in tie_analysis.prompt_ids_without_ties[:5]:  # Show first 5
-                score = tie_analysis.highest_scores_by_prompt.get(prompt_id, 'N/A')
-                log.info(f"   ✓ {prompt_id}: highest score = {score}")
-            if len(tie_analysis.prompt_ids_without_ties) > 5:
-                log.info(f"   ... and {len(tie_analysis.prompt_ids_without_ties) - 5} more")
-        
-        if tie_analysis.prompt_ids_with_ties:
-            log.info(f"📊 Prompts with ties: {len(tie_analysis.prompt_ids_with_ties)}")
-            for prompt_id in tie_analysis.prompt_ids_with_ties[:5]:  # Show first 5
-                num_ties = tie_analysis.ties_per_prompt.get(prompt_id, 0)
-                score = tie_analysis.highest_scores_by_prompt.get(prompt_id, 'N/A')
-                log.info(f"   ⚡ {prompt_id}: {num_ties} responses tied at score {score}")
-            if len(tie_analysis.prompt_ids_with_ties) > 5:
-                log.info(f"   ... and {len(tie_analysis.prompt_ids_with_ties) - 5} more")
-        
-        # Improve rubrics for all prompts using the requested strategy
+        # Extract highest score per prompt
+        highest_scores_by_prompt: Dict[str, float] = {}
+        for result in scored_data:
+            prompt_id = result["id"]
+            if prompt_id not in set(prompt_ids):
+                continue
+            scored_responses = result.get("scored_responses", [])
+            if scored_responses:
+                highest_scores_by_prompt[prompt_id] = max(
+                    r["score"] for r in scored_responses
+                )
+
+        # Improve rubrics using top-2 responses per prompt
         improved_rubrics = self.rubric_generator.improve_rubrics(
             scored_responses=scored_data,
             current_rubrics=current_rubrics,
             model=config['rubric_model'],
-            selection_strategy=config.get('selection_strategy', 'top2')
         )
 
         updated_rubrics = self.rubric_service.merge_rubrics(
@@ -130,17 +100,9 @@ class IterationManager:
 
         # Save updated rubrics for this iteration
         rubrics_file = f"{self.output_dir}/iteration_{iteration_num:02d}_rubrics.json"
-        self.file_handler.save_json({
-            "metadata": {
-                "iteration": iteration_num,
-                "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
-                "rubric_model": config['rubric_model'],
-                "total_rubrics": len(updated_rubrics),
-                "improved_prompts": len(improved_rubrics),
-                "has_ties": tie_analysis.has_ties
-            },
-            "rubrics": list(updated_rubrics.values())
-        }, rubrics_file)
+        self.file_handler.save_json(
+            list(updated_rubrics.values()), rubrics_file
+        )
         log.info(f"Saved updated rubrics to {rubrics_file}")
 
         # Prepare next iteration responses by removing used references
@@ -168,43 +130,32 @@ class IterationManager:
                 }
 
         iter_info.status = "completed" if next_responses else "responses_exhausted"
-                
-        return iter_info, tie_analysis, updated_rubrics, next_responses
-    
+
+        return iter_info, highest_scores_by_prompt, updated_rubrics, next_responses
+
     def _prepare_responses_for_scoring(
         self,
         responses: Dict[str, Dict],
         prompt_ids: List[str]
     ) -> List[Dict]:
-        """Prepare responses in format expected by scorer.
-        
-        Args:
-            responses: Response data by prompt_id
-            prompt_ids: List of prompt IDs to process
-            
-        Returns:
-            List of response data formatted for scoring
-        """
+        """Prepare responses in format expected by scorer."""
         formatted_responses = []
-        
+
         for prompt_id in prompt_ids:
             if prompt_id not in responses:
                 log.warning(f"No responses found for prompt {prompt_id}")
                 continue
-            
+
             response_data = responses[prompt_id]
-            
-            # Handle different response formats
+
             if isinstance(response_data, dict):
                 if "responses" in response_data:
-                    # Standard format
                     formatted_responses.append({
                         "id": prompt_id,
                         "prompt": response_data.get("prompt", prompt_id),
                         "responses": response_data["responses"]
                     })
                 else:
-                    # Try to extract response list
                     log.warning(f"Unexpected response format for {prompt_id}")
-            
-        return formatted_responses 
+
+        return formatted_responses

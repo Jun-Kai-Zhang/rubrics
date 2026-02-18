@@ -1,20 +1,15 @@
 """Top-level package for rubric generation helpers.
 
-This file makes ``generator`` a real Python package so that other
-modules (e.g. the future ``workflow`` package) can simply
-``import generator`` or ``from generator import X`` without relying on
-manual ``sys.path`` manipulation inside each script.
-
-It intentionally keeps a very small public surface – only the high-level
-``RubricsGenerator`` orchestrator.  Down-stream code should import other
-modules explicitly (``from generator.utils import …``).
+Public surface: the three main generator functions.  Down-stream code can
+also import other modules explicitly (``from generator.utils import …``).
 """
 
-from importlib import import_module
+from .score_responses import score_responses
+from .generate_rubrics import generate_rubrics
+from .improve_rubrics import improve_rubrics
 
 __all__ = [
-    "RubricsGenerator",
+    "score_responses",
+    "generate_rubrics",
+    "improve_rubrics",
 ]
-
-# Lazily import the orchestrator to avoid importing heavy deps (vLLM etc.)
-RubricsGenerator = import_module("generator.rubrics_generator").RubricsGenerator 
