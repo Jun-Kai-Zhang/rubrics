@@ -17,8 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from tqdm import tqdm
 
-sys.path.append(str(Path(__file__).parent))
-from generator.utils import generate_via_api
+from .utils import generate_via_api
 
 
 # ---------------------------------------------------------------------------
