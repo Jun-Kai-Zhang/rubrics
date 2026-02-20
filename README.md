@@ -18,17 +18,14 @@ This repository implements the **Refinement-through-Differentiation** workflow f
 2. **Rubric Generation** &mdash; Propose an initial set of binary, weighted criteria per prompt.
 3. **Iterative Refinement** &mdash; Score responses against the rubric, select the top-performing pair, and refine the rubric to better differentiate them. Repeat for multiple iterations.
 
-```
-Prompts ──> Response Rollouts ──> Initial Rubrics ──┐
-                                                     │
-          ┌──────────────────────────────────────────┘
-          ▼
-    ┌───────────┐     ┌───────────┐     ┌───────────┐
-    │   Score    │────>│  Select   │────>│  Improve  │──┐
-    │ Responses  │     │  Top-2    │     │  Rubrics  │  │
-    └───────────┘     └───────────┘     └───────────┘  │
-          ▲                                            │
-          └────────────── next iteration ──────────────┘
+```mermaid
+graph LR
+    A[Prompts] --> B[Response Rollouts]
+    B --> C[Initial Rubrics]
+    C --> D[Score Responses]
+    D --> E[Select Top-2]
+    E --> F[Improve Rubrics]
+    F -- next iteration --> D
 ```
 
 ## Project Structure
